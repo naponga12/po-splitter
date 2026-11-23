@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PO Splitter — สถิติการใช้งาน</title>
+  <meta name="robots" content="noindex">
+  <link rel="stylesheet" href="css/style.css">
+  <style>
+    .login { max-width: 420px; margin: 40px auto; background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 24px; display: flex; flex-direction: column; gap: 12px; }
+    .login input, .filters select { font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; }
+    .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 14px 0 20px; }
+    .kpi { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+    .kpi b { display: block; font-size: 26px; color: var(--navy); }
+    .kpi span { font-size: 13px; color: var(--muted); }
+    h2 { font-size: 17px; margin: 26px 0 8px; }
+    .tbl { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; font-size: 13px; }
+    .tbl th, .tbl td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #edf0f4; vertical-align: top; }
+    .tbl th { background: #eef2f6; font-weight: 600; }
+    .tbl td.n { text-align: right; font-variant-numeric: tabular-nums; }
+    .barcell { width: 30%; }
+    .minibar { height: 10px; background: var(--navy); border-radius: 3px; min-width: 2px; }
+    .wrap { overflow-x: auto; }
+    .filters { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .det { color: var(--muted); max-width: 420px; }
+    .err { color: var(--err); }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">PO</div>
+      <div><h1>สถิติการใช้งาน</h1><p>PO Splitter · ข้อมูลจาก Google Sheets</p></div>
+    </div>
+    <a href="index.html" style="color:#fff;font-size:14px">← กลับหน้าหลัก</a>
+  </header>
+
+  <main>
+    <form id="login" class="login">
+      <strong>เข้าสู่หน้าผู้ดูแล</strong>
+      <label style="font-size:13px;color:var(--muted)">รหัสผู้ดูแล (ADMIN_KEY ใน Apps Script)
+        <input id="key" type="password" required style="width:100%;margin-top:4px">
+      </label>
+      <button class="btn primary" type="submit">ดูสถิติ</button>
+      <div id="loginErr" class="err"></div>
+    </form>
+
+    <section id="dash" hidden>
+      <div class="filters">
+        <label>ช่วงเวลา
+          <select id="days">
+            <option value="7">7 วันล่าสุด</option>
+            <option value="30" selected>30 วันล่าสุด</option>
+            <option value="90">90 วันล่าสุด</option>
+            <option value="365">1 ปี</option>
+          </select>
+        </label>
+        <button class="btn small" id="reload">รีเฟรช</button>
+        <button class="btn small ghost" id="logout">ออกจากระบบ</button>
+        <span id="loading" class="status"></span>
+      </div>
+
+      <div class="kpis" id="kpis"></div>
+
+      <h2>รายวัน</h2>
+      <div class="wrap"><table class="tbl" id="daily"></table></div>
+
+      <h2>แยกตามเครื่อง</h2>
+      <div class="wrap"><table class="tbl" id="devices"></table></div>
+
+      <h2>กิจกรรมล่าสุด</h2>
+      <div class="wrap"><table class="tbl" id="recent"></table></div>
+    </section>
+  </main>
+  <footer>ข้อมูลดิบทั้งหมดอยู่ในชีต “Logs” ของ Google Sheet</footer>
+
+  <script src="js/config.js"></script>
+  <script>
+  (function () {
+    const EP = (window.APP_CONFIG || {}).LOG_ENDPOINT;
+    const $ = s => document.querySelector(s);
+    const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const fmt = n => Number(n || 0).toLocaleString('th-TH');
+    let key = sessionStorage.getItem('po_admin_key') || '';
+
+    if (!EP) { $('#loginErr').textContent = 'ยังไม่ได้ตั้งค่า LOG_ENDPOINT ใน js/config.js'; }
+
+    async function load() {
+      $('#loading').textContent = 'กำลังโหลด…';
+      try {
+        const url = `${EP}?action=stats&key=${encodeURIComponent(key)}&days=${$('#days').value}`;
+        const r = await fetch(url);
+        const d = await r.json();
+        if (!d.ok) throw new Error(d.error === 'unauthorized' ? 'รหัสไม่ถูกต้อง' : d.error);
+        sessionStorage.setItem('po_admin_key', key);
+        $('#login').hidden = true; $('#dash').hidden = false;
+        render(d);
+        $('#loading').textContent = 'อัปเดต ' + new Date().toLocaleTimeString('th-TH');
+      } catch (e) {
+        $('#loading').textContent = '';
+        $('#login').hidden = false; $('#dash').hidden = true;
+        $('#loginErr').textContent = 'โหลดไม่สำเร็จ: ' + e.message;
+      }
+    }
+
+    function render(d) {
+      const t = d.totals;
+      const k = [
+        ['เข้าใช้งาน (ครั้ง)', t.visits], ['เครื่องที่ใช้งาน', t.devices], ['ไฟล์ที่อัปโหลด', t.files],
+        ['หน้าที่ประมวลผล', t.pagesUploaded], ['เอกสารที่ส่งออก', t.docsExported],
+        ['ช่องที่ผู้ใช้แก้เอง', t.manualEdits], ['ข้อผิดพลาด', t.errors],
+      ];
+      $('#kpis').innerHTML = k.map(([l, v]) => `<div class="kpi"><b>${fmt(v)}</b><span>${l}</span></div>`).join('');
+
+      const max = Math.max(1, ...d.daily.map(x => x.docs));
+      $('#daily').innerHTML = '<tr><th>วันที่</th><th>เข้าใช้</th><th>เครื่อง</th><th>ไฟล์</th><th>หน้า</th><th>ส่งออก (ครั้ง)</th><th>เอกสาร</th><th class="barcell"></th></tr>' +
+        (d.daily.map(x => `<tr><td>${esc(x.day)}</td><td class="n">${fmt(x.visits)}</td><td class="n">${fmt(x.users)}</td><td class="n">${fmt(x.files)}</td><td class="n">${fmt(x.pages)}</td><td class="n">${fmt(x.exports)}</td><td class="n">${fmt(x.docs)}</td><td class="barcell"><div class="minibar" style="width:${(x.docs / max) * 100}%"></div></td></tr>`).join('') || '<tr><td colspan="8">ยังไม่มีข้อมูล</td></tr>');
+
+      $('#devices').innerHTML = '<tr><th>รหัสเครื่อง</th><th>เข้าใช้</th><th>ไฟล์</th><th>เอกสารที่ส่งออก</th><th>ใช้ล่าสุด</th></tr>' +
+        (d.devices.map(x => `<tr><td><code>${esc(x.deviceId)}</code></td><td class="n">${fmt(x.visits)}</td><td class="n">${fmt(x.files)}</td><td class="n">${fmt(x.docs)}</td><td>${esc(x.lastSeen)}</td></tr>`).join('') || '<tr><td colspan="5">ยังไม่มีข้อมูล</td></tr>');
+
+      $('#recent').innerHTML = '<tr><th>เวลา</th><th>เหตุการณ์</th><th>เครื่อง</th><th>ไฟล์</th><th>หน้า</th><th>เอกสาร</th><th>รายละเอียด</th></tr>' +
+        (d.recent.map(x => `<tr><td>${esc(x.time)}</td><td>${esc(x.event)}</td><td><code>${esc(x.deviceId)}</code></td><td>${esc(x.fileName)}</td><td class="n">${esc(x.pages)}</td><td class="n">${esc(x.docs)}</td><td class="det">${describe(x.details)}</td></tr>`).join('') || '<tr><td colspan="7">ยังไม่มีข้อมูล</td></tr>');
+    }
+
+    function describe(det) {
+      if (!det) return '';
+      if (det.exportedFiles) return esc(`${det.mode === 'zip' ? 'ZIP' : 'ทีละไฟล์'}: ` + det.exportedFiles.join(', ')) +
+        (det.manualPoEdits || det.manualItemEdits ? ` <i>(แก้เอง PO ${det.manualPoEdits}, สินค้า ${det.manualItemEdits})</i>` : '');
+      if (det.seconds != null) return esc(`ใช้ ${det.seconds} วิ · ครบ ${det.complete} · บางส่วน ${det.partial} · ไม่ได้ ${det.failed}`);
+      if (det.message) return esc(`${det.stage || ''}: ${det.message}`);
+      if (det.sizeKB != null) return esc(`${fmt(det.sizeKB)} KB`);
+      if (det.screen) return esc(`${det.screen} · ${det.language || ''}`);
+      return '';
+    }
+
+    $('#login').addEventListener('submit', e => { e.preventDefault(); key = $('#key').value; $('#loginErr').textContent = ''; load(); });
+    $('#reload').addEventListener('click', load);
+    $('#days').addEventListener('change', load);
+    $('#logout').addEventListener('click', () => { sessionStorage.removeItem('po_admin_key'); key = ''; $('#dash').hidden = true; $('#login').hidden = false; });
+    if (key && EP) load();
+  })();
+  </script>
+</body>
+</html>
