@@ -141,8 +141,19 @@
     busy: 'กำลังอ่านข้อความ…',
     ok: '✓ อ่านได้ — ตรวจตัวสะกดอีกครั้ง',
     partial: '⚠ อ่านได้บางส่วน — โปรดตรวจ',
-    err: '✕ อ่านไม่ได้ — กรอกเอง หรือถ้าเป็นหน้าต่อ ให้ติ๊ก “ต่อจากหน้าก่อน”',
+    err: '✕ อ่านไม่ได้ — กรอกเองในช่องสีเหลือง',
   };
+
+  function statusText(p) {
+    let t = STATUS_TEXT[p.status] || '';
+    // หน้าที่ 2 เป็นต้นไปของไฟล์ อาจเป็นหน้าต่อของใบ PO ก่อนหน้า
+    if (p.status === 'err' && p.index > 0) t += ' หรือถ้าเป็นหน้าต่อ ให้ติ๊ก “ต่อจากหน้าก่อน”';
+    if (p.deep && p.status !== 'busy' && p.status !== 'wait') {
+      const found = [p.deep.foundPo && 'เลข PO', p.deep.foundItem && 'ชื่อสินค้า'].filter(Boolean);
+      t += found.length ? ` · 🔍 ตรวจละเอียดแล้ว (เจอ${found.join('และ')})` : ' · 🔍 ตรวจละเอียดแล้ว';
+    }
+    return t;
+  }
 
   function updateCard(p) {
     const n = p.el;
@@ -156,7 +167,7 @@
     po.classList.toggle('edited', p.po !== p.ocrPo && done);
     item.classList.toggle('edited', p.item !== p.ocrItem && done);
     const st = n.querySelector('.status');
-    st.textContent = STATUS_TEXT[p.status] || '';
+    st.textContent = statusText(p);
     st.className = 'status ' + ({ busy: 'busy', ok: 'ok', err: 'err' }[p.status] || '');
     n.querySelector('.rerun').disabled = p.status === 'busy' || p.status === 'wait';
   }
@@ -233,13 +244,29 @@
   const getW1 = () => (w1 = w1 || makeWorker());
   const getW2 = () => (w2 = w2 || makeWorker('6'));
 
-  // แถบแถวรายการแรก: ขยาย 2 เท่า, เพิ่ม contrast, ทำขาวดำ, ลบเส้นตาราง
-  function makeStrip(src, top, height) {
-    const W = src.width * 2, H = height * 2;
+  // ตัดบางส่วนของหน้า (สัดส่วน 0–1) แล้วขยาย / เพิ่ม contrast / ทำขาวดำ / ลบเส้นตาราง
+  // opt: { x, y, w, h, scale=2, thr=170 (null = ไม่ทำขาวดำ), lines=true }
+  function makeRegion(src, opt) {
+    const sx = Math.round(src.width * (opt.x || 0)), sy = Math.round(src.height * opt.y);
+    const sw = Math.round(src.width * (opt.w || 1)), sh = Math.min(src.height - sy, Math.round(src.height * opt.h));
+    const scale = opt.scale || 2;
+    const W = Math.round(sw * scale), H = Math.round(sh * scale);
     const c = document.createElement('canvas');
     c.width = W; c.height = H;
     const ctx = c.getContext('2d', { willReadFrequently: true });
-    ctx.drawImage(src, 0, top, src.width, height, 0, 0, W, H);
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(src, sx, sy, sw, sh, 0, 0, W, H);
+    if (opt.thr === null) return c;
+    binarize(ctx, W, H, opt.thr || 170, opt.lines !== false);
+    return c;
+  }
+
+  // แถบแถวรายการแรก (ใช้ตำแหน่ง y เป็น px)
+  function makeStrip(src, top, height, thr) {
+    return makeRegion(src, { y: top / src.height, h: height / src.height, thr: thr || 170 });
+  }
+
+  function binarize(ctx, W, H, thr, removeLines) {
     const img = ctx.getImageData(0, 0, W, H);
     const d = img.data;
     const gray = new Uint8ClampedArray(W * H);
@@ -255,19 +282,70 @@
     for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
       const j = y * W + x;
       const v = ((gray[j] - lo) / span) * 255;
-      if (v < 170) { bin[j] = 1; colDark[x]++; rowDark[y]++; }
+      if (v < thr) { bin[j] = 1; colDark[x]++; rowDark[y]++; }
     }
     for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
       const j = y * W + x, i = j * 4;
-      const dark = bin[j] && colDark[x] <= H * 0.6 && rowDark[y] <= W * 0.5;
+      const dark = bin[j] && (!removeLines || (colDark[x] <= H * 0.6 && rowDark[y] <= W * 0.5));
       d[i] = d[i + 1] = d[i + 2] = dark ? 0 : 255; d[i + 3] = 255;
     }
     ctx.putImageData(img, 0, 0);
-    return c;
+  }
+
+  // OCR ด้วย worker รอง โดยสลับโหมดแบ่งหน้า (6 = บล็อกเดียว, 11 = ข้อความกระจาย)
+  let w2psm = '6';
+  async function ocrDeep(canvas, psm) {
+    const w = await getW2();
+    if (psm !== w2psm) { await w.setParameters({ tessedit_pageseg_mode: psm }); w2psm = psm; }
+    return (await w.recognize(canvas)).data;
+  }
+
+  // ---------- ตรวจละเอียด: เลข PO ----------
+  // บริเวณหัวเอกสารด้านขวา (กรอบ "เลขที่ / Number" หรือ "P/O No.") อ่านซ้ำหลายแบบจนกว่าจะเจอ
+  const PO_PASSES = [
+    { x: 0.45, y: 0.03, w: 0.55, h: 0.22, thr: 170, psm: '6' },
+    { x: 0.45, y: 0.03, w: 0.55, h: 0.22, thr: 130, psm: '6' },   // หมึกเข้ม/หนา
+    { x: 0.45, y: 0.03, w: 0.55, h: 0.22, thr: 205, psm: '6' },   // หมึกจาง
+    { x: 0.45, y: 0.03, w: 0.55, h: 0.22, thr: 170, psm: '11', scale: 3 },
+    { x: 0, y: 0, w: 1, h: 0.3, thr: null, psm: '11', scale: 1.5 }, // ทั้งแถบบน ไม่ทำขาวดำ
+  ];
+  async function deepFindPO(full) {
+    for (let i = 0; i < PO_PASSES.length; i++) {
+      const o = PO_PASSES[i];
+      const data = await ocrDeep(makeRegion(full, o), o.psm);
+      const po = P.findPONumber(data.text || '');
+      if (po) return { po, pass: i + 1 };
+    }
+    return { po: '', pass: 0 };
+  }
+
+  // ---------- ตรวจละเอียด: ชื่อสินค้า ----------
+  async function deepFindItem(full, data) {
+    const hb = P.findHeaderBottom(data);
+    const passes = [];
+    if (hb > 0) {
+      const y = (hb + 4) / full.height;
+      passes.push({ y, h: STRIP_RATIO, thr: 170, psm: '6' });
+      passes.push({ y, h: STRIP_RATIO, thr: 140, psm: '6' });
+      passes.push({ y, h: STRIP_RATIO, thr: 205, psm: '6' });
+      passes.push({ y, h: STRIP_RATIO * 2, thr: 170, psm: '6' });
+    } else {
+      // ไม่เจอหัวตาราง: อ่านช่วงกลางหน้าที่มักเป็นตารางสินค้า
+      passes.push({ y: 0.22, h: 0.3, thr: 170, psm: '6', scale: 1.5 });
+      passes.push({ y: 0.22, h: 0.3, thr: 140, psm: '6', scale: 1.5 });
+    }
+    for (let i = 0; i < passes.length; i++) {
+      const o = passes[i];
+      const d2 = await ocrDeep(makeRegion(full, o), o.psm);
+      const item = P.findItemInStrip(d2.text || '') || (hb > 0 ? '' : P.findFirstItem(d2));
+      if (item) return { item, pass: i + 1 };
+    }
+    return { item: '', pass: 0 };
   }
 
   async function ocrPage(p) {
     p.status = 'busy';
+    p.deep = null;
     updateCard(p);
     const full = await renderPage(p.file, p.index, OCR_WIDTH);
     const crop = document.createElement('canvas');
@@ -278,18 +356,29 @@
     const { data } = await (await getW1()).recognize(crop);
     let { po, item } = P.parse(data);
 
-    if (!item) { // รอบสอง: OCR เฉพาะแถวรายการแรก
-      const hb = P.findHeaderBottom(data);
-      if (hb > 0) {
-        const h = Math.round(full.height * STRIP_RATIO);
-        const r2 = await (await getW2()).recognize(makeStrip(full, Math.min(hb + 4, full.height - h), h));
-        item = P.findItemInStrip(r2.data.text);
+    // ตรวจละเอียดเฉพาะสิ่งที่รอบแรกหาไม่เจอ
+    if (!po || !item) {
+      p.deep = { po: !po, item: !item, foundPo: false, foundItem: false };
+      setStatusText(p, 'กำลังตรวจละเอียด…');
+      if (!po) {
+        const r = await deepFindPO(full);
+        if (r.po) { po = r.po; p.deep.foundPo = true; }
+      }
+      if (!item) {
+        const r = await deepFindItem(full, data);
+        if (r.item) { item = r.item; p.deep.foundItem = true; }
       }
     }
     p.ocrPo = po; p.ocrItem = item;
     if (!p.poEdited) p.po = po;
     if (!p.itemEdited) p.item = item;
     p.status = po && item ? 'ok' : (po || item ? 'partial' : 'err');
+  }
+
+  function setStatusText(p, text) {
+    const st = p.el.querySelector('.status');
+    st.textContent = text;
+    st.className = 'status busy';
   }
 
   async function runQueue() {
@@ -332,6 +421,9 @@
       details: {
         seconds: Math.round((performance.now() - file.ocrStart) / 100) / 10,
         complete: pages.filter(p => p.status === 'ok').length,
+        deepChecked: pages.filter(p => p.deep).length,
+        deepFoundPo: pages.filter(p => p.deep && p.deep.foundPo).length,
+        deepFoundItem: pages.filter(p => p.deep && p.deep.foundItem).length,
         partial: pages.filter(p => p.status === 'partial').length,
         failed: pages.filter(p => p.status === 'err').length,
         poNumbers: pages.map(p => p.ocrPo).filter(Boolean),

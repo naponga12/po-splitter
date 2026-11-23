@@ -20,18 +20,29 @@
   // ---------- เลข PO ----------
   // แบบ Lamina:  POL6911-0043   (OCR อาจอ่าน POL เป็น 01 / P0L / PO1)
   // แบบอื่น:     PO0001/70 , PO0001/6911011
+  // ตัวที่ OCR มักอ่านสับสนกับตัวเลข: O→0, I/l→1, S→5, B→8, Z→2
+  const D = '[0-9OoQDIl|!SsBZz]';
+  const D4 = `((?:${D}\\s?){3}${D})`;          // 4 หลัก (ยอมให้มีช่องว่างแทรก)
+  function fixDigits(s) {
+    return s.replace(/\s+/g, '')
+      .replace(/[OoQD]/g, '0').replace(/[Il|!]/g, '1')
+      .replace(/[Ss]/g, '5').replace(/B/g, '8').replace(/[Zz]/g, '2');
+  }
+
   function findPONumber(text) {
-    const t = text.replace(/\|/g, ' ');
+    const t = text.replace(/[|]/g, ' ').replace(/[“”"']/g, '');
     let m;
-    // 1) POL####-####  (ไม่เอา PRNT####-#### ที่เป็นเลขอ้างอิง)
-    m = t.match(/(?:^|[^A-Za-z])P\s*[O0o]\s*[Ll1I]\s*(\d{4})\s*[-–—~]\s*(\d{4})(?!\d)/);
-    if (m) return `POL${m[1]}-${m[2]}`;
+    // 1) POL####-####  (ไม่เอา PRNT####-#### ที่เป็นเลขอ้างอิง) — ขีดอาจหายหรือเป็น ~ _ .
+    m = t.match(new RegExp(`(?:^|[^A-Za-z])P\\s*[O0o]\\s*[Ll1I|]\\s*${D4}\\s*[-–—~_.]?\\s*${D4}(?![0-9])`));
+    if (m) return `POL${fixDigits(m[1])}-${fixDigits(m[2])}`;
     // 2) PO####/##  (P/O No.)
-    m = t.match(/P\s*[O0o]\s*(\d{4})\s*[\/lI1|]\s*(\d{2,7})(?!\d)/);
+    m = t.match(new RegExp(`P\\s*[O0o]\\s*[.:]?\\s*${D4}\\s*[\\/]\\s*((?:${D}){2,7})(?![0-9])`));
+    if (m) return `PO${fixDigits(m[1])}/${fixDigits(m[2])}`;
+    m = t.match(/P\s*[O0o]\s*(\d{4})\s*[lI1|]\s*(\d{2,7})(?!\d)/);   // "/" ถูกอ่านเป็น l หรือ 1
     if (m) return `PO${m[1]}/${m[2]}`;
     // 3) หลัง "เลขที่ :" / "Number :" ที่ OCR อ่านตัวหน้าเพี้ยน เช่น "016911-0043"
-    m = t.match(/(?:เลขที่|เลขที|Number|No\.?)\s*[:：]\s*[PpOo0Ll1I]{1,3}\s*(\d{4})\s*[-–—]\s*(\d{4})(?!\d)/);
-    if (m) return `POL${m[1]}-${m[2]}`;
+    m = t.match(new RegExp(`(?:เลขที่|เลขที|Number|No\\.?)\\s*[:：]\\s*[PpOo0Ll1I]{1,3}\\s*${D4}\\s*[-–—~]\\s*${D4}(?![0-9])`));
+    if (m) return `POL${fixDigits(m[1])}-${fixDigits(m[2])}`;
     return '';
   }
 
@@ -89,6 +100,8 @@
       // รหัสแบบ "exp - 001"
       if (toks[0] === '-' || toks[0] === '–') { toks.shift(); if (toks[0] && /^\d+$/.test(toks[0])) toks.shift(); }
     }
+    // รหัสสินค้าที่ OCR อ่านเป็นตัวไทยปนเลข เช่น "เนเทธะ๐01226-" / "6๐5001-1" (มีเลข ≥3 ตัว)
+    while (toks.length > 1 && ((toks[0].match(/[0-9๐-๙]/g) || []).length >= 3) && !/^\d{4}$/.test(toks[0])) toks.shift();
     let d = toks.join(' ');
     // ตัดตั้งแต่ "จำนวน หน่วย ราคา" เช่น " 35 งาน 1,000.00" / " 190.00หน่วย 195.0" / " 150 ชิ้น"
     const cuts = [
@@ -99,7 +112,7 @@
     // ล้างเศษท้าย: token ที่ไม่มีพยัญชนะ/อักษร
     toks = d.split(/\s+/).filter(Boolean);
     const junk = t => !/^[\d,.]+$/.test(t) && !/[A-Za-zก-ฮ]/.test(t);
-    while (toks.length && junk(toks[toks.length - 1])) toks.pop();
+    while (toks.length && (junk(toks[toks.length - 1]) || toks[toks.length - 1] === '0')) toks.pop();
     while (toks.length && /^[^ก-ฮA-Za-z0-9]+$/.test(toks[0])) toks.shift();
     d = toks.join(' ')
       .replace(/^[\s\-–—_.,:;'"“]+/, '')
@@ -118,9 +131,19 @@
       const m = l.match(/(?:^|\s)[1lI]\s+(?=\S)(.*)$/);
       if (!m) continue;
       const d = extractDescription(m[1]);
-      if (d && THAI.test(d)) return d;
+      if (d && THAI.test(d) && looksLikeText(d)) return d;
     }
     return '';
+  }
+
+  // กันผลขยะ เช่น "พ r T r": ต้องมีพยัญชนะไทย ≥3 ตัว หรือคำอังกฤษยาว ≥4 ตัว
+  // และ token ส่วนใหญ่ต้องไม่ใช่เศษตัวอักษร 1–2 ตัว
+  function looksLikeText(d) {
+    const thai = (d.match(/[ก-ฮ]/g) || []).length;
+    if (thai < 3 && !/[A-Za-z]{4,}/.test(d)) return false;
+    const toks = d.split(/\s+/);
+    const tiny = toks.filter(t => t.replace(/[^\wก-๙]/g, '').length <= 2).length;
+    return tiny <= toks.length / 2;
   }
 
   // ---------- ชื่อไฟล์ ----------
